@@ -1,0 +1,400 @@
+#+TITLE: Miles Foundation Deep Dive
+#+AUTHOR: Codex
+#+OPTIONS: toc:3 num:nil
+
+* Purpose and Audience
+This document is a deep technical walkthrough of the Miles codebase for new contributors.
+It explains:
+- how the system is designed end-to-end
+- where key modules live and how they import/connect
+- how runtime operations work in practice (FSDP and Megatron)
+- where to extend reward/rollout/training logic safely
+
+* Repository Topology
+At the top level, Miles is organized around an orchestration layer, backend training/inference implementations, rollout logic, and utilities.
+
+- Entry points
+  - =train.py=: synchronous rollout -> train -> weight-sync loop
+  - =train_async.py=: asynchronous overlap between rollout generation and training
+
+- Core package
+  - =miles/ray/=: Ray actor orchestration, placement groups, training actor groups
+  - =miles/rollout/=: generation pipeline, reward dispatch, dynamic filters, rollout refactor
+  - =miles/backends/=: concrete training/inference backend implementations
+  - =miles/router/=: middleware/session router components used in generation workflows
+  - =miles/utils/=: arguments, logging, distributed helpers, metrics, processing
+
+- Extensions and support
+  - =miles_plugins/=: bridge/model plugins
+  - =examples/=: runnable patterns for custom rollouts, reward logic, async and multi-agent
+  - =docs/=: architecture and usage references
+  - =tests/=: fast unit tests and GPU e2e tests
+
+* Runtime Architecture and Design
+** High-Level Control Plane
+The main driver process (in =train.py= or =train_async.py=) orchestrates everything through Ray:
+1. parse and validate args
+2. allocate GPUs with placement groups
+3. create rollout manager (inference side)
+4. create training actors (actor and optional critic)
+5. run training loop (rollout generation, training, save/eval, weight update)
+
+Key files:
+- =train.py=
+- =train_async.py=
+- =miles/ray/placement_group.py=
+
+** Data Plane Components
+- *Rollout side*:
+  - =RolloutManager= (Ray actor, coordinator)
+  - SGLang router process and SGLang engine Ray actors
+  - rollout function call path (default: =miles.rollout.sglang_rollout.generate_rollout=)
+
+- *Training side*:
+  - =RayTrainGroup= manages per-rank training Ray actors
+  - backend actor implementation chosen by =--train-backend=:
+    - FSDP: =miles.backends.fsdp_utils.FSDPTrainRayActor=
+    - Megatron: =miles.backends.megatron_utils.actor.MegatronTrainRayActor=
+
+- *Data exchange*:
+  - rollout samples -> converted train dict -> split by DP -> Ray object refs
+  - training actors read their shard and execute train step
+
+** Synchronous Loop (=train.py=)
+Canonical sequence per rollout:
+1. =rollout_manager.generate(rollout_id)=
+2. =actor_model.async_train(...)= (and critic if enabled)
+3. optional save/eval
+4. offload/clear as configured
+5. =actor_model.update_weights()= (push latest weights to rollout engines)
+
+This keeps rollout policy and training policy aligned at rollout granularity.
+
+** Asynchronous Loop (=train_async.py=)
+Pipeline behavior:
+- pre-launch next rollout while current training is running
+- periodically force sync before weight update to avoid in-flight generation mismatch
+
+Constraint:
+- colocate mode is explicitly disallowed in async mode (assertion in =train_async.py=)
+
+** Placement and GPU Layout Strategy
+In =miles/ray/placement_group.py=:
+- computes total GPU budget based on:
+  - =debug_train_only= / =debug_rollout_only=
+  - =colocate=
+  - actor/critic/rollout sizes
+- allocates one packed placement group
+- reorders bundles deterministically by node + GPU id
+- returns views for actor, critic, rollout bundle slices
+
+This deterministic ordering avoids ambiguous rank-to-device mapping.
+
+* End-to-End Sequence (Concrete)
+** Startup
+1. Driver configures logging/tracking
+2. Creates placement group
+3. Creates =RolloutManager= and rollout engines
+4. Creates train actors and runs distributed init
+5. Performs initial weight update from train model to rollout engines
+
+** Generate Path
+=RolloutManager.generate()= in =miles/ray/rollout.py=:
+- executes configured rollout function
+- optional dynamic sample trimming and global batch handling
+- converts samples to training fields
+- splits data by DP rank and stores refs via Ray object store
+
+** Train Path
+Train actor (=TrainRayActor= subclass) receives rollout shard:
+- computes logprobs/advantages/returns
+- computes loss and backprop
+- optimizer step and scheduler step
+- reports metrics
+
+** Weight Sync Path
+After training step, actor group calls =update_weights()=.
+Implementation depends on topology:
+- colocate: tensor-based/IPC style updater
+- disaggregated: distributed broadcast updater
+
+* Import and Module Structure Deep Dive
+** Orchestration Modules (=miles/ray=)
+- =placement_group.py=
+  - creates and partitions GPU placement resources
+  - creates rollout manager and training groups
+- =actor_group.py=
+  - selects backend implementation by =args.train_backend=
+  - instantiates world-size training actors
+  - exposes group APIs: init/train/save/update/offload
+- =train_actor.py=
+  - abstract base class for backend train actors
+  - distributed init, env setup, shared actor interface
+- =rollout.py=
+  - rollout manager actor and lifecycle
+  - rollout/eval generation, conversion, DP split, offload/onload
+
+** Rollout Modules (=miles/rollout=)
+- =sglang_rollout.py=
+  - default generation engine
+  - async HTTP generate calls, sample updates, RM invocation
+- =inference_rollout/*=
+  - compatibility layer and experimental rollout function loading
+- =generate_hub/*=
+  - reusable generation strategy helpers (single turn, multi turn, tools)
+- =generate_utils/*=
+  - endpoint adapters and sampling utilities
+- =filter_hub/*=
+  - dynamic filtering contracts and implementations
+- =data_source.py=
+  - source abstraction for prompt datasets
+
+** Reward Modules (=miles/rollout/rm_hub=)
+Entry point: =miles/rollout/rm_hub/__init__.py=
+- =async_rm(args, sample, **kwargs)=
+  - dispatches to custom RM when =--custom-rm-path= is set
+  - otherwise dispatches by =rm_type=
+- built-in rm types include:
+  - =math=, =dapo=, =deepscaler=, =f1=, =gpqa=, =ifbench=, =remote_rm=, =random=
+- =batched_async_rm(...)=
+  - batch evaluation path
+  - optional in-place reward writeback
+
+Reward helper modules:
+- =deepscaler.py=
+- =f1.py=
+- =gpqa.py=
+- =math_utils.py= and =math_dapo_utils.py=
+- =ifbench.py=
+
+** Trainer Modules
+- shared trainer interface: =miles/ray/train_actor.py=
+- backend selection and grouping: =miles/ray/actor_group.py=
+
+FSDP trainer stack:
+- =miles/backends/fsdp_utils/actor.py=
+  - model loading (HF), FSDP wrapping, optimizer/scheduler setup
+  - train loop hooks and checkpoint integration
+  - chooses updater: tensor vs distributed
+- =miles/backends/fsdp_utils/parallel.py=
+  - fsdp parallel state construction
+- =miles/backends/training_utils/*=
+  - common data iteration, loss logic, logging utilities
+
+Megatron trainer stack:
+- =miles/backends/megatron_utils/actor.py=
+  - Megatron-based training actor lifecycle
+- =miles/backends/megatron_utils/arguments.py=
+  - Megatron argument integration and adaptation
+- =miles/backends/megatron_utils/model_provider.py=
+  - model provider flow and custom provider integration
+- =miles/backends/megatron_utils/update_weight/*=
+  - HF bridge/direct iterators and update logic
+
+** Scheduler Modules
+- FSDP LR scheduler: =miles/backends/fsdp_utils/lr_scheduler.py=
+  - class =FSDPLRScheduler=
+  - warmup + decay styles (=constant=, =linear=, =cosine=, =inverse-square-root=, =WSD=)
+  - configured via =get_lr_scheduler(args, optimizer)=
+  - computes train iters from rollout/global batch settings
+
+- training usage wiring:
+  - instantiated in =FSDPTrainRayActor.init()=
+  - stepped in actor train loop
+
+* Key Control Interfaces and Extension Points
+** Argument and Configuration Layer
+Main parser: =miles/utils/arguments.py=
+- sets cluster/resource args
+- train backend args
+- rollout and reward args
+- customization function-path args
+
+Important dynamic function-path interfaces:
+- =--rollout-function-path=
+- =--custom-generate-function-path=
+- =--custom-rm-path=
+- =--dynamic-sampling-filter-path=
+- =--custom-loss-function-path=
+- =--custom-convert-samples-to-train-data-path=
+- =--eval-function-path=
+
+** Rollout Function Contract
+Default rollout path points to:
+- =miles.rollout.sglang_rollout.generate_rollout=
+
+Custom rollout implementation should preserve expected sample outputs:
+- tokens, response lengths, rewards, truncation/loss masks
+
+** Reward Function Contract
+Single sample contract (default behavior):
+#+begin_src python
+async def custom_rm(args, sample, **kwargs) -> float:
+    ...
+#+end_src
+
+Batch contract (group/batch paths):
+#+begin_src python
+async def custom_rm(args, samples, **kwargs) -> list[float]:
+    ...
+#+end_src
+
+* Operational Runbooks
+** Runbook A: Synchronous FSDP Training
+Use when you want direct HF-based training actor initialization with FSDP.
+
+Example command skeleton:
+#+begin_src bash
+python train.py \
+  --train-backend fsdp \
+  --hf-checkpoint /path/to/hf_ckpt \
+  --prompt-data /path/to/train.jsonl \
+  --input-key prompt --label-key label \
+  --rollout-num-gpus 8 \
+  --rollout-num-gpus-per-engine 2 \
+  --actor-num-nodes 1 --actor-num-gpus-per-node 8 \
+  --rollout-batch-size 32 \
+  --n-samples-per-prompt 8 \
+  --global-batch-size 256 \
+  --num-rollout 100 \
+  --advantage-estimator grpo \
+  --rm-type math
+#+end_src
+
+Expected runtime checkpoints:
+1. placement group creation log with deterministic bundle mapping
+2. rollout manager initialization and router/engine startup
+3. FSDP actor distributed init and scheduler setup
+4. initial =update_weights()= succeeds
+5. rollout/train iterations and periodic eval/save logs
+
+** Runbook B: Synchronous Megatron Training
+Use when training on Megatron checkpoint format and parallel settings.
+
+Example command skeleton:
+#+begin_src bash
+PYTHONPATH=/path/to/Megatron-LM python train.py \
+  --train-backend megatron \
+  --hf-checkpoint /path/to/hf_ckpt \
+  --ref-load /path/to/megatron_ckpt \
+  --load /path/to/actor_ckpt \
+  --save /path/to/output_ckpt \
+  --actor-num-nodes 1 --actor-num-gpus-per-node 8 \
+  --rollout-num-gpus 8 --rollout-num-gpus-per-engine 2 \
+  --tensor-model-parallel-size 2 \
+  --sequence-parallel \
+  --pipeline-model-parallel-size 1 \
+  --rollout-batch-size 16 \
+  --n-samples-per-prompt 8 \
+  --global-batch-size 128 \
+  --num-rollout 200 \
+  --advantage-estimator grpo \
+  --rm-type deepscaler
+#+end_src
+
+Expected runtime checkpoints:
+1. Megatron backend actor selected in =actor_group.py=
+2. Megatron distributed init and model provider load
+3. rollout generation + reward dispatch
+4. train step + weight update to rollout engines
+5. checkpoint saves at configured interval
+
+** Runbook C: Asynchronous Training
+Use to overlap next rollout generation with current training.
+
+#+begin_src bash
+python train_async.py \
+  --train-backend fsdp \
+  --hf-checkpoint /path/to/hf_ckpt \
+  --prompt-data /path/to/train.jsonl \
+  --rollout-num-gpus 8 \
+  --rollout-num-gpus-per-engine 2 \
+  --actor-num-nodes 1 --actor-num-gpus-per-node 8 \
+  --num-rollout 100 \
+  --update-weights-interval 1
+#+end_src
+
+Note:
+- =--colocate= is not supported in async mode.
+
+** Runbook D: Custom Reward Injection
+#+begin_src bash
+python train.py \
+  ... \
+  --custom-rm-path my_project.rewards.custom_rm
+#+end_src
+
+Behavior:
+- =async_rm= routes to your function instead of built-in =rm_type= dispatch.
+
+** Runbook E: Custom Rollout Injection
+Full replacement:
+#+begin_src bash
+python train.py \
+  ... \
+  --rollout-function-path my_project.rollout.my_generate_rollout
+#+end_src
+
+Generation-only override:
+#+begin_src bash
+python train.py \
+  ... \
+  --custom-generate-function-path my_project.rollout.custom_generate
+#+end_src
+
+* Data Structures and Flow Expectations
+The rollout-to-train bridge converts =Sample= objects into train fields such as:
+- tokens
+- response_lengths
+- rewards/raw_reward
+- loss_masks
+- optional rollout_log_probs / routed_experts / multimodal inputs
+
+This conversion is central because all training backends consume this normalized structure.
+
+* Failure Modes and Practical Debugging
+Common mismatch/failure points and where to inspect:
+- GPU allocation mismatch
+  - check =miles/ray/placement_group.py=
+- rollout server or router startup issues
+  - check =miles/ray/rollout.py= and =miles/backends/sglang_utils/sglang_engine.py=
+- reward dispatch errors
+  - check =miles/rollout/rm_hub/__init__.py= and selected rm module
+- train/update mismatch in colocate mode
+  - inspect updater path in backend actor and rollout offload/onload calls
+- batch math mismatch (rollout supply vs train consumption)
+  - check =global_batch_size=, =rollout_batch_size=, =n_samples_per_prompt=
+
+Recommended quick checks:
+- confirm initial =update_weights()= succeeds before first rollout
+- run with small =num_rollout= and enabled eval interval for smoke validation
+- inspect per-rollout logs for sample trim/discard behavior
+
+* Contributor Reading Path
+For a first deep read, use this order:
+1. =train.py=
+2. =miles/ray/placement_group.py=
+3. =miles/ray/rollout.py=
+4. =miles/rollout/sglang_rollout.py=
+5. =miles/rollout/rm_hub/__init__.py=
+6. =miles/ray/actor_group.py=
+7. =miles/ray/train_actor.py=
+8. =miles/backends/fsdp_utils/actor.py= and =miles/backends/fsdp_utils/lr_scheduler.py=
+9. =miles/backends/megatron_utils/actor.py=
+10. =miles/backends/training_utils/loss.py=
+
+* Architecture Notes (Current Behavior)
+- Miles uses Ray actors as the primary systems boundary.
+- Rollout is decoupled through HTTP-based SGLang serving managed by router + engines.
+- Training backend is pluggable at actor-group construction time.
+- Reward computation is a dispatch hub with function-path override for custom logic.
+- Scheduler behavior is backend-specific (explicit FSDP scheduler module).
+
+* Minimal Glossary
+- *Rollout*: inference-time generation of training samples
+- *Actor*: trainable policy model in RL loop
+- *Critic*: optional value model branch
+- *DP size*: data-parallel world width for train shard splitting
+- *Colocate*: training and rollout sharing the same GPU pool
+- *Weight update*: synchronization from train actors to rollout engines
+

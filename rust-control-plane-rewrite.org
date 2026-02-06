@@ -1,0 +1,512 @@
+#+TITLE: Rust Control-Plane Rewrite (Step-by-Step Migration Spec)
+#+AUTHOR: Miles Engineering
+#+OPTIONS: toc:3 num:nil
+
+* Summary
+This document specifies a careful rewrite of the Miles control plane in Rust, while keeping
+training and rollout workers in Python during the first migration stages.
+
+The plan is designed to avoid a big-bang cutover:
+- preserve existing training data-path behavior
+- replace orchestration and scheduling incrementally
+- validate parity at each phase with explicit acceptance gates
+- keep fast rollback to the current Python/Ray control plane
+
+* Goals
+- Replace Ray-based control-plane orchestration with a Rust orchestrator.
+- Preserve existing runtime semantics from =train.py= and =train_async.py=.
+- Keep existing Python workers and model code in place initially.
+- Add explicit, versioned control-plane APIs and typed state models.
+- Improve fault tolerance, observability, and operational predictability.
+
+* Non-Goals (Phase 1-2)
+- Rewriting PyTorch, Megatron, FSDP, or kernel-level model execution in Rust.
+- Replacing SGLang internals.
+- Changing RL algorithm math, reward semantics, or training objective definitions.
+- Breaking existing CLI workflows before compatibility adapters are available.
+
+* Current Control Plane (Ground Truth)
+** Current Entry and Orchestration
+- =train.py=: synchronous loop
+  1. parse args and initialize tracking
+  2. create placement groups
+  3. create rollout manager and training groups
+  4. loop: generate -> train -> save/eval -> update weights
+- =train_async.py=: asynchronous overlap of next rollout generation with current training
+
+Relevant files:
+- =/mnt/data_infra/workspace/miles/train.py=
+- =/mnt/data_infra/workspace/miles/train_async.py=
+
+** Current Scheduler/Placement Logic
+- =miles/ray/placement_group.py= computes actor/critic/rollout GPU allocations.
+- Deterministic bundle reordering by node + GPU id.
+- Supports colocate and disaggregated modes.
+
+** Current Rollout Orchestration
+- =miles/ray/rollout.py= defines =RolloutManager= (Ray actor).
+- Responsibilities:
+  - start router and rollout engines
+  - call configured rollout/eval functions
+  - convert samples to train data
+  - split by DP and return data refs
+  - offload/onload, recovery, health-monitor driven restart
+
+** Current Train Actor Abstraction
+- =miles/ray/train_actor.py= provides =TrainRayActor= contract:
+  - =init=, =train=, =save_model=, =update_weights=, =sleep/wake_up=, =connect_actor_critic=
+- =miles/ray/actor_group.py= chooses backend implementation:
+  - FSDP actor
+  - Megatron actor
+
+** Invariants to Preserve
+- Initial =update_weights()= must succeed before first rollout.
+- In async mode, weight update must not race with in-flight generation.
+- Eval/save cadence and periodic triggers must remain behaviorally equivalent.
+- Colocate/disaggregated resource semantics must remain equivalent.
+- Rollout output -> train input conversion contract must remain stable.
+
+* Target Architecture (Rust Control Plane + Python Workers)
+** High-Level Design
+The new control plane is a Rust process (or small set of Rust services) that manages:
+- job lifecycle
+- resource planning and worker leases
+- orchestration loop state machine
+- health monitoring and recovery
+- observability and audit event streams
+
+Python workers remain execution engines for:
+- rollout generation
+- training steps
+- weight update mechanics
+- evaluation and checkpoint save calls
+
+** Core Components
+1. *Orchestrator Service (Rust)*
+- owns job state machine
+- schedules step transitions
+- dispatches RPC commands to workers
+
+2. *Scheduler Module (Rust)*
+- computes resource plan equivalent to current placement behavior
+- supports colocate and non-colocate strategies
+
+3. *Worker Client/Transport (Rust)*
+- communicates with Python adapters using gRPC or HTTP+JSON
+- retries idempotent requests with request ids and fencing
+
+4. *State Store (Rust)*
+- in-memory canonical state + durable snapshot/checkpoint stream
+- allows restart-safe resume
+
+5. *Observability Layer (Rust)*
+- structured logs
+- metrics with labels: job_id, phase, backend, node, worker_id
+- event stream for parity/shadow comparison
+
+** Deployment Model
+- one Rust orchestrator process per job class, or one multi-tenant orchestrator
+- worker adapters run alongside existing Python stack
+- no model execution in Rust in initial phases
+
+* Public Interfaces and Contracts
+** Control-Plane API (External)
+Versioned under =/v1=.
+
+- =POST /v1/jobs=
+  - create a job from typed =JobSpec=
+- =POST /v1/jobs/{job_id}/start=
+- =POST /v1/jobs/{job_id}/pause=
+- =POST /v1/jobs/{job_id}/resume=
+- =POST /v1/jobs/{job_id}/stop=
+- =GET /v1/jobs/{job_id}/state=
+- =GET /v1/jobs/{job_id}/events=
+- =GET /v1/jobs/{job_id}/metrics=
+
+** Worker Registration and Health API
+- =POST /v1/workers/register=
+- =POST /v1/workers/{worker_id}/heartbeat=
+- =POST /v1/workers/{worker_id}/drain=
+- =GET /v1/workers=
+
+** Rust <-> Python Worker RPC Contract
+All RPC requests include:
+- =job_id=
+- =attempt_id= (for retries/fencing)
+- =request_id= (idempotency key)
+- =deadline_ms=
+
+Methods:
+- =Init=
+- =Generate=
+- =TrainStep=
+- =UpdateWeights=
+- =Eval=
+- =SaveCheckpoint=
+- =Offload=
+- =Onload=
+- =Health=
+
+Responses include:
+- =status= (ok/retryable_error/fatal_error)
+- =step_cursor= (rollout_id, train_step)
+- =metrics=
+- =error_code= + =error_context=
+
+* Type Models (Decision-Complete)
+** JobSpec (typed config)
+Required fields:
+- =job_name=
+- =mode=: sync | async
+- =backend=: fsdp | megatron
+- =resource_plan= (actor/critic/rollout config)
+- =dataset_config=
+- =rollout_config=
+- =train_config=
+- =eval_config=
+- =save_config=
+- =fault_tolerance_config=
+
+** ResourcePlan
+- =actor_num_nodes=
+- =actor_num_gpus_per_node=
+- =critic_num_nodes= (optional)
+- =critic_num_gpus_per_node= (optional)
+- =rollout_num_gpus=
+- =rollout_num_gpus_per_engine=
+- =num_gpus_per_node=
+- =colocate=
+
+** Runtime State Types
+- =JobState=
+  - CREATED, STARTING, RUNNING, PAUSED, STOPPING, STOPPED, FAILED
+- =LoopPhase=
+  - INIT, PREPARE_ROLLOUT, GENERATE, TRAIN, UPDATE_WEIGHTS, EVAL, SAVE, CLEANUP
+- =RolloutCursor=
+  - current rollout_id, total planned rollouts, epoch metadata
+- =FenceToken=
+  - monotonically increasing transition token preventing stale writes
+
+** Event Types
+- =JobEvent=
+  - timestamp, job_id, phase, event_type, payload
+- =WorkerEvent=
+  - worker_id, health status, lease status, restart count
+
+* State Machine and Sequencing
+** Synchronous Job Loop (Target Parity with =train.py=)
+1. STARTING:
+  - resolve resources and worker leases
+  - initialize workers
+2. RUNNING:
+  - if first iteration: call =UpdateWeights=
+  - for each rollout:
+    - =Generate=
+    - =TrainStep= (actor, optional critic sequence parity)
+    - periodic =SaveCheckpoint=
+    - =UpdateWeights=
+    - periodic =Eval=
+3. CLEANUP:
+  - dispose workers, flush state snapshot
+
+** Asynchronous Job Loop (Target Parity with =train_async.py=)
+- maintain one in-flight =Generate= future for next rollout
+- before =UpdateWeights=:
+  - enforce generation barrier
+  - verify no active generate task for current policy version
+- then apply update and continue
+
+** Fencing Rules
+- every transition writes fence token.
+- worker responses with stale fence token are discarded.
+- retry path reuses =request_id= but increments =attempt_id=.
+
+* Failure Model and Recovery
+** Failure Classes
+- transient network/RPC failures
+- worker process crash
+- worker unhealthy timeout
+- orchestrator crash/restart
+- irrecoverable backend error
+
+** Recovery Policy
+- transient errors: bounded retries with exponential backoff
+- worker crash:
+  - restart adapter
+  - re-issue =Init= if needed
+  - re-run current phase idempotently
+- orchestrator restart:
+  - reload latest snapshot
+  - rebuild worker lease map
+  - resume from last committed phase cursor
+
+** Terminal Failures
+Job moves to FAILED when:
+- fatal non-retryable errors exceed policy
+- checkpoint/state cannot be reconciled
+- safety guard fails (fence mismatch or duplicate step commit)
+
+* Observability and Operational Guardrails
+** Metrics
+- scheduler:
+  - lease allocation latency
+  - placement failure count
+- loop:
+  - generate latency
+  - train latency
+  - update-weight latency
+  - eval/save latency
+- reliability:
+  - retries by endpoint
+  - worker restart count
+  - recovery duration
+
+** Logging
+- structured JSON logs with correlation ids:
+  - =job_id=
+  - =rollout_id=
+  - =phase=
+  - =request_id=
+  - =worker_id=
+
+** Tracing
+- span tree:
+  - job.start
+  - loop.iteration
+  - generate/train/update/eval/save
+- include remote worker spans where possible
+
+* Step-by-Step Migration Plan
+** Phase 0: Baseline and Compatibility Matrix
+Duration: 1-2 weeks
+
+Tasks:
+- capture current event traces from representative jobs:
+  - fsdp sync
+  - megatron sync
+  - fsdp async
+- define parity checklist:
+  - order of phase transitions
+  - count of eval/save actions
+  - update timing
+- define rollback runbook for all later phases
+
+Acceptance gate:
+- baseline traces and metrics are versioned and reproducible.
+
+** Phase 1: Rust Skeleton and Typed Config
+Duration: 2-3 weeks
+
+Tasks:
+- create Rust workspace for control-plane services:
+  - =crates/orchestrator=
+  - =crates/scheduler=
+  - =crates/api=
+  - =crates/state_store=
+  - =crates/worker_client=
+- implement =JobSpec= schema and validation.
+- implement job CRUD API with persistent state snapshots.
+
+Acceptance gate:
+- can create/start/stop a no-op job in dev environment.
+
+** Phase 2: Python Worker Adapters
+Duration: 2-4 weeks
+
+Tasks:
+- implement Python adapter process exposing RPC surface:
+  - rollout adapter
+  - train adapter
+- map adapter methods to existing Miles methods without changing backend logic.
+- add health endpoint and heartbeat reporting.
+
+Acceptance gate:
+- orchestrator can call =Init/Health/Generate/TrainStep/UpdateWeights= in controlled test mode.
+
+** Phase 3: Scheduler and Resource Parity
+Duration: 2-3 weeks
+
+Tasks:
+- implement Rust scheduling algorithm mirroring current placement semantics.
+- support:
+  - actor-only
+  - actor+critic
+  - colocate
+  - disaggregated
+- deterministic assignment ordering.
+
+Acceptance gate:
+- placement outputs match current control plane for selected fixture inputs.
+
+** Phase 4: Sync Loop Parity
+Duration: 2-4 weeks
+
+Tasks:
+- implement full sync loop state machine.
+- integrate periodic save/eval logic equivalent to current periodic trigger semantics.
+- implement initial weight update precondition.
+
+Acceptance gate:
+- sync jobs pass parity checks against existing Python/Ray event traces.
+
+** Phase 5: Async Loop Parity
+Duration: 2-4 weeks
+
+Tasks:
+- implement async prefetch behavior with strict barrier before update.
+- add policy-version token for generation/update synchronization.
+
+Acceptance gate:
+- async jobs complete without update/generate race violations.
+
+** Phase 6: Fault Tolerance and Resume
+Duration: 3-5 weeks
+
+Tasks:
+- implement retry policy, worker restart handling, snapshot-based resume.
+- validate idempotent command handling for retries and duplicate delivery.
+
+Acceptance gate:
+- chaos tests pass for worker crash and orchestrator restart scenarios.
+
+** Phase 7: Shadow Mode
+Duration: 2-4 weeks
+
+Tasks:
+- run Rust control-plane in read/compare mode alongside production Python/Ray.
+- diff event streams for ordering/decision mismatch.
+
+Acceptance gate:
+- mismatch rate below agreed threshold across representative workloads.
+
+** Phase 8: Progressive Cutover
+Duration: 2-6 weeks
+
+Tasks:
+- canary routing by job percentage:
+  - 5% -> 25% -> 50% -> 100%
+- automatic rollback on SLO breach.
+
+Acceptance gate:
+- sustained stability over burn-in window.
+
+** Phase 9: Decommission Legacy Control Plane
+Duration: 1-2 weeks
+
+Tasks:
+- freeze old orchestration paths.
+- keep temporary compatibility command wrappers.
+- remove legacy path after deprecation window.
+
+Acceptance gate:
+- all production jobs run on Rust orchestrator with no open blockers.
+
+* Testing and Acceptance Matrix
+** Unit Tests
+- config validation
+- state transition legality
+- retry and fence-token behavior
+- scheduler deterministic assignment
+
+** Integration Tests
+- orchestrator <-> Python adapter RPC contract
+- end-to-end sync loop with mock workers
+- end-to-end async loop with mock workers
+
+** Parity Tests (Critical)
+- compare against baseline from current system:
+  - step ordering
+  - update timing
+  - eval/save cadence
+  - terminal statuses
+
+** Failure Injection Tests
+- kill rollout worker during generate
+- kill train worker during train step
+- kill orchestrator mid-loop and restart
+- duplicate response delivery with stale fence token
+
+** Load and Soak
+- long-running job simulations
+- monitor memory growth, retry storms, worker churn behavior
+
+* Rollout and Rollback Plan
+** Rollout
+1. local/dev
+2. staging with synthetic data
+3. shadow mode in production-like workloads
+4. canary percentages with automated health gates
+5. full cutover after burn-in
+
+** Rollback
+- trigger conditions:
+  - error-rate spike
+  - throughput regression beyond threshold
+  - phase mismatch or state corruption signal
+- rollback action:
+  - stop new job admission to Rust orchestrator
+  - reroute to legacy Python/Ray control-plane launcher
+  - retain snapshots for postmortem replay
+
+* Security and Safety Considerations
+- enforce mTLS or signed tokens for orchestrator-worker RPC.
+- strict schema validation for =JobSpec= and worker responses.
+- rate-limit mutating control-plane API endpoints.
+- immutable event log for job lifecycle auditing.
+
+* Risks and Mitigations
+** Risk: Semantic drift vs current control plane
+Mitigation:
+- explicit parity test suite and shadow diff before cutover.
+
+** Risk: Worker adapter instability
+Mitigation:
+- start with minimal adapter wrappers and strict RPC contracts.
+
+** Risk: Hidden coupling to Ray internals
+Mitigation:
+- capture current side effects in baseline traces and preserve where required.
+
+** Risk: Operational complexity during dual-run
+Mitigation:
+- clear ownership boundaries and automated diff tooling.
+
+* Engineering Work Breakdown
+** Team Roles
+- Control-plane core (Rust): API, state machine, scheduler
+- Adapter team (Python): worker wrappers and compatibility
+- Reliability/ops: observability, chaos tests, rollout automation
+- QA/parity: trace comparison and acceptance automation
+
+** Suggested Milestone Cadence
+- Milestone A: phase 1-2 complete
+- Milestone B: phase 3-5 complete
+- Milestone C: phase 6-7 complete
+- Milestone D: phase 8-9 complete
+
+* Compatibility Strategy for Existing Users
+- Keep existing user-facing launch scripts operational during migration.
+- Add new launch path:
+  - legacy: =python train.py ...= or =python train_async.py ...=
+  - new: control-plane submit command that ingests equivalent job spec
+- maintain argument translation layer until full deprecation.
+
+* Explicit Assumptions and Defaults
+- This rewrite targets control plane only in early stages.
+- Python workers remain source of truth for train/rollout execution logic.
+- No algorithmic changes are introduced.
+- Rust orchestrator is default target runtime after successful canary.
+- Cutover is gated by parity + reliability acceptance, not schedule-only targets.
+
+* Definition of Done
+A phase is done only when:
+- implementation tasks are complete
+- associated test suite is green
+- acceptance gate for that phase is satisfied
+- rollback path is verified and documented
+
+Program done criteria:
+- 100% control-plane traffic handled by Rust orchestrator
+- production SLOs equal or better than baseline
+- legacy Ray control-plane paths decommissioned after deprecation window
+

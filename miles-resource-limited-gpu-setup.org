@@ -1,0 +1,318 @@
+#+TITLE: Miles RL Training on Resource-Limited GPUs
+#+AUTHOR: Miles Engineering Notes
+#+OPTIONS: toc:2 num:t
+
+* Purpose and Audience
+This design doc describes a validated setup to run Miles RL training workflows on
+resource-limited NVIDIA GPUs (for example, GeForce GTX 1070 Ti class with 8GB VRAM)
+inside the Zephyr container workflow.
+
+Primary goals:
+- Reliability-first operation on constrained hardware.
+- Reproducible setup and troubleshooting steps.
+- A concrete mitigation ladder for common failures (dependency, backend, memory).
+
+Audience:
+- Users onboarding to this repo and Zephyr container runtime.
+- Engineers debugging low-VRAM Miles/FSDP training runs.
+
+* Environment Baseline
+** Validated stack
+- Host launch script: =container/launch_container.sh=
+- Container image: =sygaldry/zephyr:sglang-20260226=
+- Python: =3.13.8= (inside MLSys sglang env)
+- PyTorch: =2.9.0=
+- CUDA runtime (torch): =12.9=
+- Distributed backends:
+  - NCCL: available
+  - Gloo: not built in this image
+  - MPI: available
+
+** Hard constraints for this guide
+- Do not use =flash_attn= or =flashinfer=.
+- Use pure PyTorch eager-attention path for training compatibility.
+- Assume GPU memory is tight; prioritize fitting over speed.
+
+** Key validation command
+#+begin_src bash
+./container/launch_container.sh bash -lc 'python - <<"PY"
+import torch, torch.distributed as dist
+print("torch", torch.__version__)
+print("cuda_available", torch.cuda.is_available())
+print("cuda_count", torch.cuda.device_count())
+print("cuda_version", torch.version.cuda)
+print("nccl", dist.is_nccl_available())
+print("gloo", dist.is_gloo_available())
+print("mpi", dist.is_mpi_available())
+PY'
+#+end_src
+
+* System Architecture for Low-Resource Mode
+** Control flow
+1. Host launches GPU container via =container/launch_container.sh=.
+2. Container activates MLSys sglang env by default.
+3. Dependency layering script installs missing Python packages into that env.
+4. Ray head is launched locally inside the same container.
+5. =train.py= executes Miles rollout + FSDP train actor pipeline.
+
+** Data flow for SFT smoke path
+- Prompt data source must contain a =messages= column that is already chat-structured.
+- Each sample should include assistant completion content if using SFT loss.
+- The smoke path uses:
+  - =--rollout-function-path miles.rollout.sft_rollout.generate_rollout=
+  - =--input-key messages=
+
+** Memory behavior in this mode
+Major GPU memory consumers:
+- Model parameters (FSDP-wrapped)
+- Forward/backward activations
+- Optimizer states (Adam =exp_avg= and =exp_avg_sq= are significant)
+
+Low-resource tuning knobs:
+- Token-level pressure: =--use-dynamic-batch-size --max-tokens-per-gpu=...
+- Activation pressure: =--gradient-checkpointing=
+- VRAM release between phases: =--offload-train --offload-rollout=
+- Optimizer-state relocation: =--fsdp-cpu-offload --fsdp-cpu-backend mpi=
+
+* Setup Procedure (Validated)
+** 1) Launch container and install runtime libs
+#+begin_src bash
+./container/launch_container.sh bash -lc '
+set -euo pipefail
+apt-get update -y >/dev/null
+apt-get install -y libsndfile1 >/dev/null
+cd /workspace
+bash scripts/setup-uv-pytorch-layer.sh
+'
+#+end_src
+
+** 2) Start local ray head
+#+begin_src bash
+./container/launch_container.sh bash -lc '
+set -euo pipefail
+source /opt/mlsys-envs/sglang/bin/activate
+unset RAY_ADDRESS || true
+ray stop --force >/dev/null 2>&1 || true
+ray start --head --node-ip-address 127.0.0.1 --num-gpus 1 --disable-usage-stats
+'
+#+end_src
+
+** 3) Run mitigation ladder
+#+begin_src bash
+./container/launch_container.sh bash -lc '
+set -euo pipefail
+cd /workspace
+source /opt/mlsys-envs/sglang/bin/activate
+export RAY_ADDRESS=127.0.0.1:6379
+bash scripts/run-qwen3-0.6B-oom-ladder.sh
+'
+#+end_src
+
+* Problems Encountered and Resolutions
+Each issue is listed as:
+- Problem
+- Symptom
+- Root cause
+- Resolution
+- Prevention
+
+** Issue 1: Missing =sglang_router=
+- Symptom: =ModuleNotFoundError: No module named 'sglang_router'=
+- Root cause: New image did not include =sglang-router= package in runtime env.
+- Resolution: Add =sglang-router>=0.2.3= to =scripts/setup-uv-pytorch-layer.sh=.
+- Prevention: Keep dependency verification imports in layer script.
+
+** Issue 2: Missing =wandb=
+- Symptom: =ModuleNotFoundError: No module named 'wandb'=
+- Root cause: Tracking utility imported wandb unconditionally.
+- Resolution: Add =wandb= to layered dependencies.
+- Prevention: Validate import list after layering.
+
+** Issue 3: Missing =networkx=
+- Symptom: import failure during torch/compile paths.
+- Root cause: transitive dependency not present in container env.
+- Resolution: Add =networkx= to layered dependencies.
+- Prevention: keep import verification script authoritative.
+
+** Issue 4: Missing =accelerate=
+- Symptom: =ModuleNotFoundError: No module named 'accelerate'=
+- Root cause: FSDP actor path imports accelerate helper.
+- Resolution: Install =accelerate= with =--no-deps= (avoid replacing torch stack).
+- Prevention: no-deps install policy for packages that may drag alternate torch wheels.
+
+** Issue 5: Missing =megatron=
+- Symptom: =ModuleNotFoundError: No module named 'megatron'=
+- Root cause: log-prob code path imported megatron fused CE.
+- Resolution: Layer =megatron-core= and add fallback logic in ppo utils.
+- Prevention: maintain pure-PyTorch fallback for old/non-TE environments.
+
+** Issue 6: Ray cluster address mismatch
+- Symptom: attempts to connect to stale GCS address.
+- Root cause: pre-existing Ray address context.
+- Resolution: explicitly stop Ray, start local head, and set =RAY_ADDRESS= to local.
+- Prevention: use startup sequence from this doc before every smoke run.
+
+** Issue 7: Gloo unavailable
+- Symptom: =RuntimeError: Distributed package doesn't have Gloo built in=
+- Root cause: this torch build lacks gloo backend.
+- Resolution: fallback in distributed group init to world group when gloo unavailable.
+- Prevention: prefer NCCL paths and avoid hard gloo dependency in low-resource image.
+
+** Issue 8: Dataset schema mismatch
+- Symptom: type errors in loss-mask/message handling.
+- Root cause:
+  - =messages= already chat-structured, so applying chat template was incorrect.
+  - Original gsm8k train rows were prompt-centric for this path.
+- Resolution:
+  - remove =--apply-chat-template= from smoke path.
+  - create a small SFT parquet with [system, user, assistant] messages.
+- Prevention: validate sample row shape before launching training.
+
+** Issue 9: Triton unsupported for old GPU
+- Symptom: =GPUTooOldForTriton= on GTX 1070 Ti (SM 6.1).
+- Root cause: internal compiled/fused paths attempted Triton codegen.
+- Resolution:
+  - disable compile paths where possible.
+  - add eager fallback in log-prob computation.
+  - remove internal compiled helper in entropy path.
+- Prevention: keep non-Triton fallback paths for legacy GPU support.
+
+** Issue 10: OOM during optimizer step
+- Symptom: OOM at Adam state allocation in =optimizer.step()=.
+- Root cause: optimizer state allocation peak exceeds 8GB budget.
+- Resolution: first successful profile was FSDP CPU offload + MPI backend (A4).
+- Prevention: use mitigation ladder and prefer A4 for this GPU class.
+
+* OOM Mitigation Ladder (Operational)
+Implemented script:
+- =scripts/run-qwen3-0.6B-oom-ladder.sh=
+
+Attempt order:
+1. =A1-minimal-token=
+2. =A2-plus-grad-ckpt=
+3. =A3-offload-train-rollout=
+4. =A4-fsdp-cpu-offload-mpi=
+5. =A5-sgd-fallback= (only if previous attempts fail)
+
+** Validated winner on 8GB class GPU
+- =A4-fsdp-cpu-offload-mpi= passed.
+- Key settings:
+  - =GRADIENT_CHECKPOINTING=1=
+  - =USE_DYNAMIC_BATCH_SIZE=1=
+  - =MAX_TOKENS_PER_GPU=192=
+  - =LOG_PROBS_MAX_TOKENS_PER_GPU=96=
+  - =FSDP_CPU_OFFLOAD=1=
+  - =FSDP_CPU_BACKEND=mpi=
+
+* Onboarding Guide
+** Prerequisites
+- NVIDIA driver/runtime operational.
+- Docker with NVIDIA runtime configured.
+- Local model and dataset mounts accessible via launch script.
+
+** Quick start (copy/paste)
+#+begin_src bash
+# 1) Prepare container env
+./container/launch_container.sh bash -lc '
+set -euo pipefail
+apt-get update -y >/dev/null
+apt-get install -y libsndfile1 >/dev/null
+cd /workspace
+bash scripts/setup-uv-pytorch-layer.sh
+'
+
+# 2) Start local ray
+./container/launch_container.sh bash -lc '
+set -euo pipefail
+source /opt/mlsys-envs/sglang/bin/activate
+unset RAY_ADDRESS || true
+ray stop --force >/dev/null 2>&1 || true
+ray start --head --node-ip-address 127.0.0.1 --num-gpus 1 --disable-usage-stats
+'
+
+# 3) Run OOM mitigation ladder
+./container/launch_container.sh bash -lc '
+set -euo pipefail
+cd /workspace
+source /opt/mlsys-envs/sglang/bin/activate
+export RAY_ADDRESS=127.0.0.1:6379
+bash scripts/run-qwen3-0.6B-oom-ladder.sh
+'
+#+end_src
+
+** What success looks like
+- Ladder output ends with:
+  - =[PASS] A4-fsdp-cpu-offload-mpi=
+- Training logs include:
+  - =step 0: {'train/loss': ...}= and no OOM traceback.
+
+* Command Reference
+** Torch/NCCL check
+#+begin_src bash
+./container/launch_container.sh bash -lc 'python - <<"PY"
+import torch, torch.distributed as dist
+print(torch.__version__, torch.version.cuda)
+print("cuda", torch.cuda.is_available(), torch.cuda.device_count())
+print("nccl", dist.is_nccl_available(), "gloo", dist.is_gloo_available(), "mpi", dist.is_mpi_available())
+PY'
+#+end_src
+
+** Layer dependencies
+#+begin_src bash
+./container/launch_container.sh bash -lc 'cd /workspace && bash scripts/setup-uv-pytorch-layer.sh'
+#+end_src
+
+** Single smoke invocation with explicit low-memory profile
+#+begin_src bash
+./container/launch_container.sh bash -lc '
+set -euo pipefail
+cd /workspace
+source /opt/mlsys-envs/sglang/bin/activate
+export RAY_ADDRESS=127.0.0.1:6379
+MODE=direct NUM_GPUS=1 \
+GLOBAL_BATCH_SIZE=1 MICRO_BATCH_SIZE=1 \
+USE_DYNAMIC_BATCH_SIZE=1 MAX_TOKENS_PER_GPU=192 LOG_PROBS_MAX_TOKENS_PER_GPU=96 \
+GRADIENT_CHECKPOINTING=1 FSDP_CPU_OFFLOAD=1 FSDP_CPU_BACKEND=mpi \
+bash scripts/run-qwen3-0.6B-sft-pytorch-smoke.sh
+'
+#+end_src
+
+* Troubleshooting Matrix
+| Error signature                                         | Action                                                                       |
+|---------------------------------------------------------+------------------------------------------------------------------------------|
+| =ModuleNotFoundError: sglang_router=                      | Re-run =scripts/setup-uv-pytorch-layer.sh=; verify imports.                    |
+| =ModuleNotFoundError: wandb/networkx/accelerate/megatron= | Ensure layer script includes package and succeeded.                          |
+| =Distributed package doesn't have Gloo built in=          | Use NCCL path; avoid hard gloo assumptions; use MPI for CPU offload backend. |
+| =GPUTooOldForTriton=                                      | Ensure fallback/eager paths active; avoid Triton-dependent kernels.          |
+| OOM in =adam.py _init_group=                              | Use ladder; prefer =A4= profile with FSDP CPU offload.                         |
+| Loss-mask vs response-length mismatch                   | Validate SFT parquet contains assistant messages.                            |
+| Ray connecting to stale cluster                         | stop/start local ray head and export local =RAY_ADDRESS=.                      |
+
+* Design Decisions and Tradeoffs
+** Why CPU offload was selected
+- It directly targets optimizer-state memory pressure, the dominant failure point.
+- It enabled completion where batching/checkpointing alone failed.
+
+** Tradeoffs
+- Throughput is lower due to CPU<->GPU movement and hybrid comm overhead.
+- Startup and step latency increase (acceptable for constrained hardware reliability).
+
+** Why keep SGD fallback
+- Provides an escape hatch for smoke validation when Adam state is too expensive.
+- Not default; intended only for low-resource validation scenarios.
+
+* Maintenance and Update Protocol
+When image/version changes:
+1. Re-run torch/backend validation command.
+2. Re-run dependency layering verification.
+3. Run mitigation ladder and record winning profile.
+4. Update this doc sections:
+   - Environment Baseline
+   - Issues/Resolutions (if new)
+   - Validated winner profile
+
+* Last Validated Snapshot
+- Date: 2026-03-01
+- Image: =sygaldry/zephyr:sglang-20260226=
+- GPU class: GeForce GTX 1070 Ti (SM 6.1, 8GB)
+- Passing profile: =A4-fsdp-cpu-offload-mpi=
