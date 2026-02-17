@@ -1,0 +1,128 @@
+ARG ZEPHYR_SGLANG_BASE_REF=ghcr.io/phi9t/sygaldry/zephyr:sglang
+FROM ${ZEPHYR_SGLANG_BASE_REF}
+
+ARG MILES_COMMIT=local
+ARG MILES_VERSION=sglang-miles-dev
+ARG RAY_VERSION=2.53.0
+
+USER root
+WORKDIR /root
+
+# Keep utility parity with the current Miles image line.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      nvtop rsync dnsutils libsndfile1 curl ca-certificates nodejs npm && \
+    rm -rf /var/lib/apt/lists/*
+
+# Tooling CLIs for developer workflows in the base Miles image.
+RUN npm install -g @openai/codex && codex --version
+RUN curl -fsSL https://opencode.ai/install | bash && \
+    ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode && \
+    (opencode --help >/dev/null 2>&1 || true)
+
+# Capture stack-owned versions and force app-layer installs to respect them.
+RUN python3 - <<'PY' > /tmp/zephyr-stack-constraints.txt
+import importlib
+
+stack_modules = (
+    ("torch", "torch"),
+    ("torchaudio", "torchaudio"),
+    ("jax", "jax"),
+    ("jaxlib", "jaxlib"),
+    ("triton", "triton"),
+    ("llvmlite", "llvmlite"),
+    ("soundfile", "soundfile"),
+    ("numpy", "numpy"),
+    ("sglang", "sglang"),
+)
+for package_name, module_name in stack_modules:
+    try:
+        mod = importlib.import_module(module_name)
+        version = getattr(mod, "__version__", None)
+        if version:
+            print(f"{package_name}=={version}")
+    except Exception:
+        pass
+PY
+
+COPY docker/requirements.zephyr-app.txt /tmp/requirements.zephyr-app.txt
+RUN /bin/bash -lc '\
+set -euo pipefail; \
+venv_root="${SYGALDRY_MLSYS_VENV_ROOT:-/opt/mlsys-envs}"; \
+env_name="${SYGALDRY_MLSYS_ENV:-}"; \
+if [[ -z "${env_name}" && -f "${venv_root}/.default-env" ]]; then \
+  env_name="$(head -n1 "${venv_root}/.default-env" 2>/dev/null || true)"; \
+fi; \
+[[ -n "${env_name}" ]] || { echo "No MLSys env found under ${venv_root}" >&2; exit 1; }; \
+if [[ -f "${venv_root}/${env_name}/bin/activate" ]]; then \
+  source "${venv_root}/${env_name}/bin/activate"; \
+else \
+  ap="$(find "${venv_root}/${env_name}" -maxdepth 3 -path "*/bin/activate" -type f 2>/dev/null | head -n1 || true)"; \
+  [[ -n "${ap}" ]] || { echo "Cannot locate activate script for ${env_name}" >&2; exit 1; }; \
+  source "${ap}"; \
+fi; \
+xargs -r -n 1 python3 -m pip install --no-cache-dir --no-deps -c /tmp/zephyr-stack-constraints.txt < /tmp/requirements.zephyr-app.txt; \
+python3 -m pip install --no-cache-dir --no-deps -c /tmp/zephyr-stack-constraints.txt "ray[default]==${RAY_VERSION}"; \
+python3 -m pip install --no-cache-dir --no-deps -c /tmp/zephyr-stack-constraints.txt msgpack; \
+python3 -c "import importlib,subprocess,sys; \
+mods=(\"ray\",\"torch\",\"jax\",\"jaxlib\",\"triton\",\"llvmlite\",\"pynvml\"); \
+[importlib.import_module(m) for m in mods]; \
+freeze=subprocess.check_output([sys.executable,\"-m\",\"pip\",\"list\",\"--format=freeze\"],text=True); \
+forbidden=(\"nvidia-cublas-cu\",\"nvidia-cuda-\",\"nvidia-cudnn-cu\",\"nvidia-cufft-cu\",\"nvidia-curand-cu\",\"nvidia-cusolver-cu\",\"nvidia-cusparse-cu\",\"nvidia-cusparselt-cu\",\"nvidia-nccl-cu\",\"nvidia-nvjitlink-cu\",\"nvidia-nvtx-cu\",\"nvidia-cufile-cu\"); \
+bad=[line for line in freeze.splitlines() if line.lower().startswith(forbidden)]; \
+import ray,torch,jax,jaxlib,triton,llvmlite; \
+print(\"runtime:\", ray.__version__, torch.__version__); \
+print(\"core:\", jax.__version__, jaxlib.__version__, triton.__version__, llvmlite.__version__); \
+print(\"pynvml: ok\"); \
+(_ for _ in ()).throw(SystemExit(\"Forbidden CUDA/CUDNN pip packages detected: \" + \", \".join(bad))) if bad else None"'
+
+# Keep the same mbridge dependency used by the current Miles Dockerfile.
+RUN /bin/bash -lc '\
+set -euo pipefail; \
+venv_root="${SYGALDRY_MLSYS_VENV_ROOT:-/opt/mlsys-envs}"; \
+env_name="${SYGALDRY_MLSYS_ENV:-}"; \
+if [[ -z "${env_name}" && -f "${venv_root}/.default-env" ]]; then \
+  env_name="$(head -n1 "${venv_root}/.default-env" 2>/dev/null || true)"; \
+fi; \
+[[ -n "${env_name}" ]] || { echo "No MLSys env found under ${venv_root}" >&2; exit 1; }; \
+if [[ -f "${venv_root}/${env_name}/bin/activate" ]]; then \
+  source "${venv_root}/${env_name}/bin/activate"; \
+else \
+  ap="$(find "${venv_root}/${env_name}" -maxdepth 3 -path "*/bin/activate" -type f 2>/dev/null | head -n1 || true)"; \
+  [[ -n "${ap}" ]] || { echo "Cannot locate activate script for ${env_name}" >&2; exit 1; }; \
+  source "${ap}"; \
+fi; \
+python3 -m pip install --no-cache-dir --no-deps \
+  git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c'
+
+# Install Miles in editable mode from build context (source-of-truth dev image).
+COPY . /opt/miles
+RUN /bin/bash -lc '\
+set -euo pipefail; \
+venv_root="${SYGALDRY_MLSYS_VENV_ROOT:-/opt/mlsys-envs}"; \
+env_name="${SYGALDRY_MLSYS_ENV:-}"; \
+if [[ -z "${env_name}" && -f "${venv_root}/.default-env" ]]; then \
+  env_name="$(head -n1 "${venv_root}/.default-env" 2>/dev/null || true)"; \
+fi; \
+[[ -n "${env_name}" ]] || { echo "No MLSys env found under ${venv_root}" >&2; exit 1; }; \
+if [[ -f "${venv_root}/${env_name}/bin/activate" ]]; then \
+  source "${venv_root}/${env_name}/bin/activate"; \
+else \
+  ap="$(find "${venv_root}/${env_name}" -maxdepth 3 -path "*/bin/activate" -type f 2>/dev/null | head -n1 || true)"; \
+  [[ -n "${ap}" ]] || { echo "Cannot locate activate script for ${env_name}" >&2; exit 1; }; \
+  source "${ap}"; \
+fi; \
+cd /opt/miles; \
+python3 -m pip install --no-cache-dir -e . --no-deps'
+
+ENV HOME=/root
+ENV MILES_IMAGE_LINE=zephyr-sglang
+ENV MILES_IMAGE_VERSION=${MILES_VERSION}
+
+WORKDIR /workspace
+
+LABEL maintainer="Miles Team"
+LABEL description="Miles dev image on Zephyr sglang snapshot base"
+LABEL miles.image.line="zephyr-sglang"
+LABEL miles.image.version="${MILES_VERSION}"
+LABEL miles.source.commit="${MILES_COMMIT}"

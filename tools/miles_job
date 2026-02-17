@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Miles container job runner (host-side)
+
+Usage:
+  miles_job run    --project-id <id> --job <name> -- <command>
+  miles_job status --project-id <id> --job <name>
+  miles_job tail   --project-id <id> --job <name> [--lines N]
+  miles_job stop   --project-id <id> --job <name>
+  miles_job health --project-id <id> --job <name>
+
+Notes:
+- Commands are executed inside the container via: bash -lc "<command>"
+- JSONL logs: /mnt/data_infra/zephyr_container_infra/projects/<id>/outputs/.run-metadata/<run_id>/<job>-<timestamp>.jsonl
+- Status:      /mnt/data_infra/zephyr_container_infra/projects/<id>/outputs/.run-metadata/<run_id>/<job>.status
+- Raw logs:    /mnt/data_infra/zephyr_container_infra/projects/<id>/runs/<run_id>/raw/<job>-<timestamp>.log
+USAGE
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+DEFAULT_PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+readonly DEFAULT_PROJECT_ROOT
+
+PROJECT_ROOT="${MILES_HOME:-${DEFAULT_PROJECT_ROOT}}"
+CACHE_ROOT="${ZEPHYR_CACHE_ROOT:-/mnt/data_infra/zephyr_container_infra}"
+PROJECTS_ROOT="${ZEPHYR_PROJECTS_ROOT:-${CACHE_ROOT}/projects}"
+
+SUBCMD="${1:-}"
+shift || true
+
+PROJECT_ID=""
+JOB_NAME=""
+LINES=80
+RUN_ID=""
+LEASE_MODE="${ZEPHYR_LEASE_MODE:-warn}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-root)
+      PROJECT_ROOT="$2"; shift 2 ;;
+    --project-id)
+      PROJECT_ID="$2"; shift 2 ;;
+    --job|--job-name)
+      JOB_NAME="$2"; shift 2 ;;
+    --run-id)
+      RUN_ID="$2"; shift 2 ;;
+    --lease-mode)
+      LEASE_MODE="$2"; shift 2 ;;
+    --lines)
+      LINES="$2"; shift 2 ;;
+    --)
+      shift; break ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      break ;;
+  esac
+done
+
+if [[ -z "${SUBCMD}" ]]; then
+  usage; exit 2
+fi
+
+if [[ ! -x "${PROJECT_ROOT}/container/launch_container.sh" ]]; then
+  echo "Launcher not found: ${PROJECT_ROOT}/container/launch_container.sh" >&2
+  echo "Use --project-root to point to the Miles repository." >&2
+  exit 2
+fi
+
+if [[ -z "${RUN_ID}" ]]; then
+  RUN_ID="run-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+
+HOST_PROJECT_ROOT="${PROJECTS_ROOT}/${PROJECT_ID}"
+RAW_LOG_DIR="${HOST_PROJECT_ROOT}/runs/${RUN_ID}/raw"
+EVENT_DIR="${HOST_PROJECT_ROOT}/runs/${RUN_ID}/events"
+OUTPUT_METADATA_DIR="${HOST_PROJECT_ROOT}/outputs/.run-metadata/${RUN_ID}"
+STATUS_FILE_HOST="${OUTPUT_METADATA_DIR}/${JOB_NAME}.status"
+LATEST_LINK="${HOST_PROJECT_ROOT}/runs/latest-${JOB_NAME}"
+
+case "${SUBCMD}" in
+  run)
+    if [[ -z "${PROJECT_ID}" || -z "${JOB_NAME}" ]]; then
+      usage; exit 2
+    fi
+    if [[ $# -lt 1 ]]; then
+      echo "Missing command after --" >&2
+      usage; exit 2
+    fi
+    # Preserve original argv safely so shell metacharacters/quotes survive.
+    CMD_ESCAPED="$(printf '%q ' "$@")"
+    CMD_ESCAPED="${CMD_ESCAPED% }"
+    mkdir -p "${RAW_LOG_DIR}" "${EVENT_DIR}" "${HOST_PROJECT_ROOT}/runs" "${OUTPUT_METADATA_DIR}"
+    TS="$(date +%Y%m%d-%H%M%S)"
+    RAW_LOG_FILE="${RAW_LOG_DIR}/${JOB_NAME}-${TS}.log"
+    JSONL_FILE_CONTAINER="/root/outputs/.run-metadata/${RUN_ID}/${JOB_NAME}-${TS}.jsonl"
+    STATUS_FILE_CONTAINER="/root/outputs/.run-metadata/${RUN_ID}/${JOB_NAME}.status"
+    JSONL_FILE_HOST="${OUTPUT_METADATA_DIR}/${JOB_NAME}-${TS}.jsonl"
+    PID_FILE="${RAW_LOG_DIR}/${JOB_NAME}-${TS}.pid"
+
+    read -r -d '' WRAP_BODY <<'WRAP' || true
+set -euo pipefail
+JOB_NAME="${JOB_NAME}"
+STATUS_FILE="${STATUS_FILE}"
+COMMAND_STRING="${COMMAND_STRING}"
+LOG_FILE="${LOG_FILE}"
+
+mkdir -p "$(dirname "${STATUS_FILE}")" "$(dirname "${LOG_FILE}")"
+
+log_json() {
+  printf '{"ts":"%s","event":"%s","job":"%s","msg":"%s"}\n' "$(date -Is)" "$1" "${JOB_NAME}" "$2" | tee -a "${LOG_FILE}" >/dev/null
+}
+
+log_json start "starting"
+printf 'START job=%s ts=%s\n' "${JOB_NAME}" "$(date -Is)" > "${STATUS_FILE}"
+
+heartbeat() {
+  while true; do
+    printf 'PROGRESS job=%s ts=%s msg=running\n' "${JOB_NAME}" "$(date -Is)" > "${STATUS_FILE}"
+    log_json progress "running"
+    sleep 300
+  done
+}
+
+heartbeat &
+HB_PID=$!
+
+set +e
+bash -lc "${COMMAND_STRING}"
+RC=$?
+set -e
+
+kill "${HB_PID}" 2>/dev/null || true
+if [[ $RC -eq 0 ]]; then
+  printf 'DONE job=%s ts=%s rc=0\n' "${JOB_NAME}" "$(date -Is)" > "${STATUS_FILE}"
+  log_json done "rc=0"
+else
+  printf 'FAILED job=%s ts=%s rc=%s\n' "${JOB_NAME}" "$(date -Is)" "${RC}" > "${STATUS_FILE}"
+  log_json failed "rc=${RC}"
+fi
+exit "${RC}"
+WRAP
+
+    WRAP_B64=$(printf '%s' "${WRAP_BODY}" | base64 | tr -d '\n')
+    q_job=$(printf '%q' "${JOB_NAME}")
+    q_status=$(printf '%q' "${STATUS_FILE_CONTAINER}")
+    q_cmd=$(printf '%q' "${CMD_ESCAPED}")
+    q_log=$(printf '%q' "${JSONL_FILE_CONTAINER}")
+
+    RUNNER_CMD="export JOB_NAME=${q_job} STATUS_FILE=${q_status} COMMAND_STRING=${q_cmd} LOG_FILE=${q_log}; echo ${WRAP_B64} | base64 -d | bash"
+
+    nohup env \
+      MILES_PROJECT_ID="${PROJECT_ID}" \
+      MILES_RUN_ID="${RUN_ID}" \
+      MILES_ENTRYPOINT="run-job" \
+      ZEPHYR_LEASE_MODE="${LEASE_MODE}" \
+      "${PROJECT_ROOT}/container/launch_container.sh" \
+      bash -lc "${RUNNER_CMD}" \
+      >>"${RAW_LOG_FILE}" 2>&1 &
+
+    JOB_PID=$!
+    echo "${JOB_PID}" > "${PID_FILE}"
+    cp "${PID_FILE}" "${HOST_PROJECT_ROOT}/runs/${JOB_NAME}.pid"
+
+    if [[ -L "${LATEST_LINK}" || -e "${LATEST_LINK}" ]]; then
+      rm -rf "${LATEST_LINK}"
+    fi
+    ln -s "${HOST_PROJECT_ROOT}/runs/${RUN_ID}" "${LATEST_LINK}"
+
+    cat <<EOM
+Started job: ${JOB_NAME}
+Project ID:  ${PROJECT_ID}
+Run ID:      ${RUN_ID}
+PID:         ${JOB_PID}
+JSONL:       ${JSONL_FILE_HOST}
+Raw log:     ${RAW_LOG_FILE}
+Status file: ${STATUS_FILE_HOST}
+EOM
+    ;;
+
+  status)
+    if [[ -z "${PROJECT_ID}" || -z "${JOB_NAME}" ]]; then
+      usage; exit 2
+    fi
+    if [[ -z "${RUN_ID}" ]]; then
+      RUN_ID="$(basename "$(readlink "${PROJECTS_ROOT}/${PROJECT_ID}/runs/latest-${JOB_NAME}" 2>/dev/null || true)")"
+    fi
+    [[ -n "${RUN_ID}" ]] || { echo "No run id known for ${JOB_NAME}" >&2; exit 1; }
+    STATUS_FILE_HOST="${PROJECTS_ROOT}/${PROJECT_ID}/outputs/.run-metadata/${RUN_ID}/${JOB_NAME}.status"
+    if [[ -f "${STATUS_FILE_HOST}" ]]; then
+      tail -n 1 "${STATUS_FILE_HOST}"
+    else
+      echo "Status file not found: ${STATUS_FILE_HOST}" >&2
+      exit 1
+    fi
+    ;;
+
+  tail)
+    if [[ -z "${PROJECT_ID}" || -z "${JOB_NAME}" ]]; then
+      usage; exit 2
+    fi
+    if [[ -z "${RUN_ID}" ]]; then
+      RUN_ID="$(basename "$(readlink "${PROJECTS_ROOT}/${PROJECT_ID}/runs/latest-${JOB_NAME}" 2>/dev/null || true)")"
+    fi
+    [[ -n "${RUN_ID}" ]] || { echo "No run id known for ${JOB_NAME}" >&2; exit 1; }
+    EVENT_DIR="${PROJECTS_ROOT}/${PROJECT_ID}/outputs/.run-metadata/${RUN_ID}"
+    LAST_LOG=$(ls -t "${EVENT_DIR}/${JOB_NAME}-"*.jsonl 2>/dev/null | head -n 1 || true)
+    if [[ -n "${LAST_LOG}" && -f "${LAST_LOG}" ]]; then
+      tail -n "${LINES}" "${LAST_LOG}"
+    else
+      echo "Log file not found for job prefix: ${EVENT_DIR}/${JOB_NAME}-*.jsonl" >&2
+      exit 1
+    fi
+    ;;
+
+  stop)
+    if [[ -z "${PROJECT_ID}" || -z "${JOB_NAME}" ]]; then
+      usage; exit 2
+    fi
+    PID_FILE="${PROJECTS_ROOT}/${PROJECT_ID}/runs/${JOB_NAME}.pid"
+    if [[ ! -f "${PID_FILE}" ]]; then
+      echo "PID file not found" >&2
+      exit 1
+    fi
+    PID=$(cat "${PID_FILE}")
+    if kill "${PID}" 2>/dev/null; then
+      echo "Stopped PID ${PID}"
+    else
+      echo "PID ${PID} not running" >&2
+      exit 1
+    fi
+    ;;
+
+  health)
+    if [[ -z "${PROJECT_ID}" || -z "${JOB_NAME}" ]]; then
+      usage; exit 2
+    fi
+    PID_FILE="${PROJECTS_ROOT}/${PROJECT_ID}/runs/${JOB_NAME}.pid"
+    if [[ -f "${PID_FILE}" ]]; then
+      PID=$(cat "${PID_FILE}")
+      if ps -p "${PID}" >/dev/null 2>&1; then
+        echo "running pid=${PID}"
+      else
+        echo "stale pid=${PID}"
+      fi
+    else
+      echo "pid=unknown"
+    fi
+    if [[ -z "${RUN_ID}" ]]; then
+      RUN_ID="$(basename "$(readlink "${PROJECTS_ROOT}/${PROJECT_ID}/runs/latest-${JOB_NAME}" 2>/dev/null || true)")"
+    fi
+    if [[ -n "${RUN_ID}" ]]; then
+      STATUS_FILE_HOST="${PROJECTS_ROOT}/${PROJECT_ID}/outputs/.run-metadata/${RUN_ID}/${JOB_NAME}.status"
+      [[ -f "${STATUS_FILE_HOST}" ]] && tail -n 1 "${STATUS_FILE_HOST}" || echo "status=missing"
+    else
+      echo "status=missing"
+    fi
+    ;;
+
+  *)
+    usage; exit 2
+    ;;
+esac

@@ -29,12 +29,12 @@ Please execute the following commands to pull the latest image and start an inte
 
 ```shell
 # Pull the latest image
-docker pull radixark/miles:latest
+docker pull ghcr.io/phi9t/sygaldry/zephyr:sglang-miles-dev
 
 # Start the container
 docker run --rm --gpus all --ipc=host --shm-size=16g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
-  -it radixark/miles:latest /bin/bash
+  -it ghcr.io/phi9t/sygaldry/zephyr:sglang-miles-dev /bin/bash
 ```
 
 ### Install miles

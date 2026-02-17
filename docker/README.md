@@ -18,6 +18,32 @@ The command to build:
 just release
 ```
 
+## Zephyr Snapshot-Based Dev Image (Source of Truth)
+
+For containerized SGLang/Miles development, build and publish the Zephyr-based
+image line on GHCR:
+
+```bash
+# Required: immutable snapshot digest pin
+BASE_DIGEST=sha256:<zephyr-snapshot-digest> just -f docker/justfile release-sglang-miles-dev
+```
+
+Defaults:
+- Base snapshot: `ghcr.io/phi9t/sygaldry/zephyr:sglang@${BASE_DIGEST}`
+- Target image: `ghcr.io/phi9t/sygaldry/zephyr:sglang-miles-dev`
+
+Core stack invariants (`torch`, `jax`, `jaxlib`, `triton`, `llvmlite`) are
+validated by `docker/verify_zephyr_core_stack.sh` and must not drift.
+Runtime package availability (`ray`, `torch`, `sglang`) is validated by
+`docker/verify_runtime_stack.sh`.
+
+Ray is pre-baked in this image line (`ray[default]`, pinned via
+`RAY_VERSION`, default `2.53.0`) without modifying the protected Zephyr core
+stack.
+`nvidia-ml-py` is also pre-baked for NVML metrics, while CUDA/CUDNN pip
+packages (for example `nvidia-cublas-cu*`, `nvidia-cudnn-cu*`) are explicitly
+blocked in the Docker build.
+
 Before each update, we will test the following models with 64xH100:
 
 - Qwen3-4B sync

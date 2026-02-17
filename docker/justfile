@@ -38,3 +38,69 @@ debug:
 
     docker tag radixark/miles-test:$IMAGE_TAG radixark/miles-test:latest
     docker push radixark/miles-test:latest
+
+# -----------------------------------------------------------------------------
+# Zephyr snapshot-based Miles image (GHCR source of truth)
+# -----------------------------------------------------------------------------
+
+build-sglang-miles-dev:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    BASE_IMAGE="${BASE_IMAGE:-ghcr.io/phi9t/sygaldry/zephyr:sglang}"
+    BASE_DIGEST="${BASE_DIGEST:-}"
+    IMAGE_TAG="${IMAGE_TAG:-sglang-miles-dev}"
+    IMAGE="ghcr.io/phi9t/sygaldry/zephyr:${IMAGE_TAG}"
+
+    if [ -z "${BASE_DIGEST}" ]; then
+        echo "BASE_DIGEST is required (example: sha256:...)" >&2
+        exit 2
+    fi
+
+    docker build -f docker/Dockerfile.zephyr-sglang . \
+      --build-arg ZEPHYR_SGLANG_BASE_REF="${BASE_IMAGE}@${BASE_DIGEST}" \
+      --build-arg MILES_COMMIT="$(git rev-parse --short HEAD)" \
+      --build-arg MILES_VERSION="${IMAGE_TAG}" \
+      --build-arg RAY_VERSION="${RAY_VERSION:-2.53.0}" \
+      -t "${IMAGE}"
+
+verify-sglang-miles-dev:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    BASE_IMAGE="${BASE_IMAGE:-ghcr.io/phi9t/sygaldry/zephyr:sglang}"
+    BASE_DIGEST="${BASE_DIGEST:-}"
+    IMAGE_TAG="${IMAGE_TAG:-sglang-miles-dev}"
+    TARGET_IMAGE="ghcr.io/phi9t/sygaldry/zephyr:${IMAGE_TAG}"
+
+    if [ -z "${BASE_DIGEST}" ]; then
+        echo "BASE_DIGEST is required (example: sha256:...)" >&2
+        exit 2
+    fi
+
+    docker/verify_zephyr_core_stack.sh \
+      --base "${BASE_IMAGE}@${BASE_DIGEST}" \
+      --target "${TARGET_IMAGE}"
+    docker/verify_runtime_stack.sh --image "${TARGET_IMAGE}"
+
+release-sglang-miles-dev:
+    #!/bin/bash
+    set -euxo pipefail
+    cd ..
+
+    BASE_IMAGE="${BASE_IMAGE:-ghcr.io/phi9t/sygaldry/zephyr:sglang}"
+    BASE_DIGEST="${BASE_DIGEST:-}"
+    IMAGE_TAG="${IMAGE_TAG:-sglang-miles-dev}"
+    TARGET_IMAGE="ghcr.io/phi9t/sygaldry/zephyr:${IMAGE_TAG}"
+
+    if [ -z "${BASE_DIGEST}" ]; then
+        echo "BASE_DIGEST is required (example: sha256:...)" >&2
+        exit 2
+    fi
+
+    just -f docker/justfile build-sglang-miles-dev BASE_IMAGE="${BASE_IMAGE}" BASE_DIGEST="${BASE_DIGEST}" IMAGE_TAG="${IMAGE_TAG}"
+    docker/verify_zephyr_core_stack.sh --base "${BASE_IMAGE}@${BASE_DIGEST}" --target "${TARGET_IMAGE}"
+    docker/verify_runtime_stack.sh --image "${TARGET_IMAGE}"
+    docker push "${TARGET_IMAGE}"

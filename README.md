@@ -85,8 +85,8 @@ Miles is designed to handle the complexity of modern RL workloads across various
 We recommend using our official Docker image for the best performance and compatibility:
 
 ```bash
-# Pull the latest image
-docker pull radixark/miles:latest
+# Pull the Zephyr-based dev image
+docker pull ghcr.io/phi9t/sygaldry/zephyr:sglang-miles-dev
 
 # Or install from source
 pip install -r requirements.txt
