@@ -6,7 +6,6 @@ from argparse import Namespace
 import ray
 import torch
 import torch.distributed as dist
-from ring_flash_attn import update_ring_flash_attn_params
 from tqdm import tqdm
 from transformers import AutoConfig
 
@@ -36,6 +35,11 @@ from .parallel import create_fsdp_parallel_state
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor
 
 logger = logging.getLogger(__name__)
+
+try:
+    from ring_flash_attn import update_ring_flash_attn_params
+except ImportError:
+    update_ring_flash_attn_params = None
 
 
 class FSDPTrainRayActor(TrainRayActor):
@@ -122,8 +126,15 @@ class FSDPTrainRayActor(TrainRayActor):
                 eps=args.adam_eps,
                 weight_decay=args.weight_decay,
             )
+        elif args.optimizer == "sgd":
+            self.optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=args.lr,
+                momentum=args.sgd_momentum,
+                weight_decay=args.weight_decay,
+            )
         else:
-            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
+            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam', 'sgd'")
 
         # Initialize LR scheduler
         self.lr_scheduler = get_lr_scheduler(args, self.optimizer)
@@ -616,6 +627,11 @@ class FSDPTrainRayActor(TrainRayActor):
         position_ids = batch["position_ids"]
 
         if self.parallel_state.cp_size > 1:
+            if update_ring_flash_attn_params is None:
+                raise ImportError(
+                    "context_parallel_size > 1 requires ring_flash_attn. "
+                    "Install ring_flash_attn/flash_attn or set --context-parallel-size 1."
+                )
             if "cu_seqlens" in batch:
                 cu_seqlens = batch["cu_seqlens"]
                 if not cu_seqlens.is_cuda:

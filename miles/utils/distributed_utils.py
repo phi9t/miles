@@ -21,7 +21,12 @@ def init_gloo_group():
     """Initialize Gloo group for distributed communication."""
     global GLOO_GROUP
     if GLOO_GROUP is None:
-        GLOO_GROUP = dist.new_group(backend="gloo")
+        # Some torch builds (e.g., minimal serving images) do not include Gloo.
+        # Fall back to WORLD so NCCL-only environments can still run.
+        if dist.is_gloo_available():
+            GLOO_GROUP = dist.new_group(backend="gloo")
+        else:
+            GLOO_GROUP = dist.group.WORLD
     return GLOO_GROUP
 
 

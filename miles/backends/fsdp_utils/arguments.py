@@ -8,7 +8,7 @@ import yaml
 @dataclass
 class FSDPArgs:
     # Optim
-    optimizer: str = "adam"  # Optimizer type: "adam" (AdamW)
+    optimizer: str = "adam"  # Optimizer type: "adam" (AdamW) or "sgd"
     lr: float = 2e-5
     lr_warmup_init: float = 0.0
     min_lr: float = 0.0
@@ -24,6 +24,7 @@ class FSDPArgs:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
+    sgd_momentum: float = 0.0
     warmup_ratio: float = 0.03
 
     attn_implementation: str = "flash_attention_2"

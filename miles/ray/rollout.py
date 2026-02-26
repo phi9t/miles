@@ -10,9 +10,7 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 from miles.rollout.base_types import (
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
@@ -43,6 +41,16 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _get_sglang_memory_tags():
+    try:
+        from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+
+        return GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+    except Exception:
+        # Keep debug-train-only paths functional even when SGLang extras are unavailable.
+        return "cuda_graph", "kv_cache", "weights"
+
+
 @ray.remote
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
@@ -52,10 +60,18 @@ class RolloutManager:
 
         self.args = args
         self.pg = pg
-        _start_router(args)
+        self._router_addr = None
+        if not self.args.debug_train_only:
+            _start_router(args)
+            self._router_addr = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+            init_http_client(args)
+
         # TODO make args immutable
-        init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
-        init_http_client(args)
+        init_tracking(
+            args,
+            primary=False,
+            **({"router_addr": self._router_addr} if self._router_addr else {}),
+        )
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
@@ -81,11 +97,12 @@ class RolloutManager:
 
         if self.args.debug_train_only:
             self.all_rollout_engines = []
+            self.num_new_engines = 0
         else:
             num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
             num_engines = args.rollout_num_gpus // num_gpu_per_engine
             self.all_rollout_engines = [None] * num_engines
-        self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
+            self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
@@ -189,10 +206,12 @@ class RolloutManager:
         )
 
     def onload_weights(self):
-        self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        _, _, weights_tag = _get_sglang_memory_tags()
+        self.onload(tags=[weights_tag])
 
     def onload_kv(self):
-        self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+        cuda_graph_tag, kv_cache_tag, _ = _get_sglang_memory_tags()
+        self.onload(tags=[kv_cache_tag, cuda_graph_tag])
 
     def recover_rollout_engines(self):
         """Restart any dead rollout engines and update num_new_engines for update_weights detection."""
@@ -205,9 +224,10 @@ class RolloutManager:
         logger.info(f"Recovered {self.num_new_engines} dead rollout engines")
         assert self.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
         if self.args.offload_rollout and dead_indices:
+            _, _, weights_tag = _get_sglang_memory_tags()
             new_engines = [self.all_rollout_engines[i] for i in dead_indices]
             ray.get([engine.release_memory_occupation.remote() for engine in new_engines])
-            ray.get([engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for engine in new_engines])
+            ray.get([engine.resume_memory_occupation.remote(tags=[weights_tag]) for engine in new_engines])
 
         return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
 
@@ -473,6 +493,8 @@ class RolloutManager:
 def init_rollout_engines(args, pg, all_rollout_engines):
     if args.debug_train_only:
         return 0
+
+    from miles.backends.sglang_utils.sglang_engine import SGLangEngine
 
     num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
     num_engines = args.rollout_num_gpus // num_gpu_per_engine

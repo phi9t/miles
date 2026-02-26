@@ -2,7 +2,6 @@ import logging
 from argparse import Namespace
 
 import torch.distributed as dist
-from ring_flash_attn import substitute_hf_flash_attn
 from torch.distributed.device_mesh import init_device_mesh
 
 from miles.utils.distributed_utils import get_gloo_group
@@ -10,6 +9,11 @@ from miles.utils.distributed_utils import get_gloo_group
 from ..training_utils.parallel import ParallelState
 
 logger = logging.getLogger(__name__)
+
+try:
+    from ring_flash_attn import substitute_hf_flash_attn
+except ImportError:
+    substitute_hf_flash_attn = None
 
 
 def create_fsdp_parallel_state(args: Namespace) -> ParallelState:
@@ -31,6 +35,11 @@ def create_fsdp_parallel_state(args: Namespace) -> ParallelState:
 
     # Setup Ring Flash Attention with CP group from mesh (only when cp_size > 1)
     if cp_size > 1:
+        if substitute_hf_flash_attn is None:
+            raise ImportError(
+                "context_parallel_size > 1 requires ring_flash_attn. "
+                "Install ring_flash_attn/flash_attn or set --context-parallel-size 1."
+            )
         substitute_hf_flash_attn(mesh.get_group("cp"), heads_k_stride=1)
         logger.info(f"[Rank {rank}] CP initialized via device mesh")
     else:

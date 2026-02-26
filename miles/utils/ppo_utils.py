@@ -150,13 +150,17 @@ def compute_policy_loss(
 
 
 def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
-    # TODO: when megatron is not installed, fall back to naive implementation
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    try:
+        from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
-    # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
-    logits = logits.unsqueeze(1)
-    tokens = tokens.unsqueeze(1)
-    return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
+        # convert to [seq_len, batch_size, vocab_size] as expected by fused CE
+        fused_logits = logits.unsqueeze(1)
+        fused_tokens = tokens.unsqueeze(1)
+        return -fused_vocab_parallel_cross_entropy(fused_logits, fused_tokens, process_group)
+    except Exception:
+        # Fallback for environments without Megatron fused CE support (e.g., old GPUs).
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        return torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
 
 
 # from https://github.com/volcengine/verl/blob/0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99
@@ -164,8 +168,6 @@ class _VocabParallelEntropy(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, vocab_parallel_logits: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
-
-        @torch.compile(dynamic=True)
         def mul_reduce(a, b):
             return (a * b).sum(dim=-1, keepdim=True)
 
