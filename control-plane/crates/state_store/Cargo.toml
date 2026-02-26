@@ -1,0 +1,19 @@
+[package]
+name = "miles-control-state-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+miles-control-api = { path = "../api" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lib]
+doctest = false

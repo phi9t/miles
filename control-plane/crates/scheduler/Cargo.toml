@@ -1,0 +1,13 @@
+[package]
+name = "miles-control-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+miles-control-api = { path = "../api" }
+thiserror.workspace = true
+
+[lib]
+doctest = false

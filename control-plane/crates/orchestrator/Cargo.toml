@@ -1,0 +1,29 @@
+[package]
+name = "miles-control-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+miles-control-api = { path = "../api" }
+miles-control-scheduler = { path = "../scheduler" }
+miles-control-state-store = { path = "../state_store" }
+miles-control-worker-client = { path = "../worker_client" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[lib]
+doctest = false

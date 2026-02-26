@@ -1,0 +1,42 @@
+{
+  "job_name": "fsdp-smoke",
+  "mode": "sync",
+  "backend": "fsdp",
+  "resource_plan": {
+    "actor_num_nodes": 1,
+    "actor_num_gpus_per_node": 2,
+    "critic_num_nodes": null,
+    "critic_num_gpus_per_node": null,
+    "rollout_num_gpus": 2,
+    "rollout_num_gpus_per_engine": 1,
+    "num_gpus_per_node": 8,
+    "colocate": false
+  },
+  "dataset_config": {
+    "prompt_data": "/data/prompts.jsonl",
+    "input_key": "prompt",
+    "label_key": "label"
+  },
+  "rollout_config": {
+    "batch_size": 16,
+    "n_samples_per_prompt": 8,
+    "max_response_len": 2048
+  },
+  "train_config": {
+    "global_batch_size": 128,
+    "num_rollout": 10,
+    "update_weights_interval": 1
+  },
+  "eval_config": {
+    "eval_interval": 5
+  },
+  "save_config": {
+    "save_interval": 5,
+    "output_dir": "/tmp/out"
+  },
+  "fault_tolerance_config": {
+    "enabled": true,
+    "max_retries": 3,
+    "retry_backoff_ms": 250
+  }
+}
